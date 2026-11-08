@@ -620,9 +620,10 @@ def combine(per_ex, p):
 
     def info(names, counter):
         # names: [(label, weight%)] -> shown as "BINANCE-S-15, BINANCE-F-20"
-        # Counts are reported separately per market type, each as "x/y":
+        # Counts are reported separately per market type, each as "x/y/z":
         # x = exchanges of that type confirming the signal,
-        # y = exchanges of that type that traded on this bar.
+        # y = exchanges of that type that traded on this bar,
+        # z = the confirming volume as a percentage of that type's traded volume.
         def _ex(labels):
             return len({ex_of(n) for n in labels})
         nm_s = [n for n, _ in names if n.endswith("-S")]
@@ -630,16 +631,34 @@ def combine(per_ex, p):
         nm_c = [n for n, _ in names if n.endswith(TV_CFD_SUFFIX)]
         nm_tvs = [n for n, _ in names if n.endswith(TV_CRYPTO_SUFFIX_S)]
         nm_tvp = [n for n, _ in names if n.endswith(TV_CRYPTO_SUFFIX_P)]
+        act_s = [n for n in active if n.endswith("-S")]
+        act_f = [n for n in active if n.endswith("-F")]
+        act_c = [n for n in active if n.endswith(TV_CFD_SUFFIX)]
+        act_tvs = [n for n in active if n.endswith(TV_CRYPTO_SUFFIX_S)]
+        act_tvp = [n for n in active if n.endswith(TV_CRYPTO_SUFFIX_P)]
+
+        def _volp(conf, grp):
+            tv = sum(cur_vol.get(l, 0.0) for l in grp)
+            if tv <= 0:
+                return 0
+            cv = sum(cur_vol.get(l, 0.0) for l in conf)
+            return int(round(cv / tv * 100))
+
         return {"ex_s": _ex(nm_s),
-                "ex_s_total": _ex([n for n in active if n.endswith("-S")]),
+                "ex_s_total": _ex(act_s),
                 "ex_f": _ex(nm_f),
-                "ex_f_total": _ex([n for n in active if n.endswith("-F")]),
+                "ex_f_total": _ex(act_f),
                 "ex_c": _ex(nm_c),
-                "ex_c_total": _ex([n for n in active if n.endswith(TV_CFD_SUFFIX)]),
+                "ex_c_total": _ex(act_c),
                 "ex_tvs": _ex(nm_tvs),
-                "ex_tvs_total": _ex([n for n in active if n.endswith(TV_CRYPTO_SUFFIX_S)]),
+                "ex_tvs_total": _ex(act_tvs),
                 "ex_tvp": _ex(nm_tvp),
-                "ex_tvp_total": _ex([n for n in active if n.endswith(TV_CRYPTO_SUFFIX_P)]),
+                "ex_tvp_total": _ex(act_tvp),
+                "volp_s": _volp(nm_s, act_s),
+                "volp_f": _volp(nm_f, act_f),
+                "volp_c": _volp(nm_c, act_c),
+                "volp_tvs": _volp(nm_tvs, act_tvs),
+                "volp_tvp": _volp(nm_tvp, act_tvp),
                 "pct": round(counter * 100),
                 "names": [f"{n}-{w}" for n, w in names]}
 
@@ -757,19 +776,23 @@ def xau_weekend_closed(now_ms):
 
 
 def counts_line(info):
-    """'Spot: x/y | Futures: x/y | CFD: x/y | TV-Spot: x/y | TV-Perp: x/y'
-    - only the market types that exist."""
+    """'Spot: x/y/z | Futures: x/y/z | CFD: x/y/z | TV-Spot: x/y/z | TV-Perp: x/y/z'
+    - only the market types that exist. z = the confirming exchanges' volume
+    as a percentage of that market type's total traded volume on the bar
+    (same method as the per-family triple in pairs_text)."""
+    def _t(a, b, v):
+        return f"{a}/{b}/{v}"
     parts = []
     if info.get("ex_s_total"):
-        parts.append(f"Spot: {info['ex_s']}/{info['ex_s_total']}")
+        parts.append(f"Spot: {_t(info['ex_s'], info['ex_s_total'], info.get('volp_s', 0))}")
     if info.get("ex_f_total"):
-        parts.append(f"Futures: {info['ex_f']}/{info['ex_f_total']}")
+        parts.append(f"Futures: {_t(info['ex_f'], info['ex_f_total'], info.get('volp_f', 0))}")
     if info.get("ex_c_total"):
-        parts.append(f"CFD: {info['ex_c']}/{info['ex_c_total']}")
+        parts.append(f"CFD: {_t(info['ex_c'], info['ex_c_total'], info.get('volp_c', 0))}")
     if info.get("ex_tvs_total"):
-        parts.append(f"TV-Spot: {info['ex_tvs']}/{info['ex_tvs_total']}")
+        parts.append(f"TV-Spot: {_t(info['ex_tvs'], info['ex_tvs_total'], info.get('volp_tvs', 0))}")
     if info.get("ex_tvp_total"):
-        parts.append(f"TV-Perp: {info['ex_tvp']}/{info['ex_tvp_total']}")
+        parts.append(f"TV-Perp: {_t(info['ex_tvp'], info['ex_tvp_total'], info.get('volp_tvp', 0))}")
     return " | ".join(parts)
 
 
