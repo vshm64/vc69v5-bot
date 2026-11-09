@@ -1,0 +1,50 @@
+name: vc69v5-signals
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:        # manual "Run workflow" button for testing
+
+permissions:
+  contents: write           # needed to commit the state file back
+
+concurrency:
+  group: vc69v5-signals
+  cancel-in-progress: true  # never overlap two runs
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      TV_USER: ${{ secrets.TV_USER }}
+      TV_PASS: ${{ secrets.TV_PASS }}
+      FIRST_RUN_TEHRAN: "2026-11-08 13:30"   # first check: 13:30 Tehran (in the past = no waiting)
+      CHART_TFS: "3m,15m,30m,45m"            # chart timeframes
+      LOWER_TF: "1m"                         # lower timeframe
+      ASSETS: "BTC,PEPE,ZEC"                 # BTC/PEPE/ZEC only (spot+futures, ccxt+TV)
+      FIRST_WINDOW_MIN: "15"                 # first run baseline: last quarter hour
+      MAX_LOOKBACK_MIN: "360"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check for new signals
+        run: python vc69v5_headless.py --state state/state.json
+
+      - name: Commit state
+        run: |
+          git config user.name "vc69v5-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/state.json
+          git diff --cached --quiet || git commit -m "state: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          git push
