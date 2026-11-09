@@ -95,33 +95,37 @@ SOURCES = ["close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "hlcc4"]
 LOWER_TFS = ["1m", "3m", "5m", "15m"]
 MIN_CHART_TF_MIN = 3
 
-# The 20 exchanges with the highest combined 24h volume (spot + USDT futures)
-# across BTC/PEPE/ZEC, ranked from the volume reports of 2026-11-06.
+# Live-checked with ccxt on 2026-11-09 (see ccxt_exchange_rank.xlsx):
+# TOKOCRYPTO removed - its spot candles are a 1:1 BINANCE mirror and it has
+#   no futures at all (it just double-weighted BINANCE);
+# BIGONE removed - near-dead (PEPE 210 / ZEC 648 USDT per 5 minutes, futures
+#   fetch broken in ccxt);
+# CRYPTOCOM added - independent top-10 venue (BTC/PEPE spot via ccxt, no ZEC
+#   spot, no USDT swaps) - contributes spot votes only.
 # Regional twins that just mirror the same market (binanceusdm, myokx, okxus,
-# bybitid) are covered by their parent entry below, so they are not listed again.
-# DIGIFINEX (rank 2, ~17.4B) was left out on request: its futures volume is
-# base*last-derived and looks inflated; POLONIEX (rank 21) takes its place.
+# bybitid) are covered by their parent entry below, so they are not listed
+# again. DIGIFINEX stays out on request: its futures volume is base*last-
+# derived and looks inflated; POLONIEX takes its place.
 EXCHANGES = [
-    ("BINANCE", ["binance"]),          # 1  ~27.9B USDT (spot + USDM futures)
-    ("OKX", ["okx"]),                  # 3  ~16.1B USDT
-    ("GATE", ["gate", "gateio"]),      # 4  ~13.8B USDT
-    ("BYBIT", ["bybit"]),              # 5  ~11.4B USDT
-    ("TOOBIT", ["toobit"]),            # 6  ~8.9B USDT
-    ("MEXC", ["mexc"]),                # 7  ~7.2B USDT
-    ("BITGET", ["bitget"]),            # 8  ~5.3B USDT
-    ("WHITEBIT", ["whitebit"]),        # 9  ~4.9B USDT
-    ("XT", ["xt"]),                    # 10 ~3.6B USDT
-    ("DEEPCOIN", ["deepcoin"]),        # 11 ~2.6B USDT
-    ("TOKOCRYPTO", ["tokocrypto"]),    # 12 ~2.1B USDT
-    ("BINGX", ["bingx"]),              # 13 ~2.1B USDT
-    ("BITRUE", ["bitrue"]),            # 14 ~2.0B USDT
-    ("HTX", ["htx", "huobi"]),         # 15 ~1.3B USDT
-    ("LBANK", ["lbank"]),              # 16 ~1.2B USDT
-    ("BIGONE", ["bigone"]),            # 17 ~1.0B USDT
-    ("ASTER", ["aster"]),              # 18 ~0.75B USDT
-    ("KUCOIN", ["kucoin"]),            # 19 ~0.62B USDT
-    ("BLOFIN", ["blofin"]),            # 20 ~0.62B USDT
-    ("POLONIEX", ["poloniex"]),        # 21 ~0.53B USDT (replaces DIGIFINEX)
+    ("BINANCE", ["binance"]),          # 1  spot + USDM futures (one id serves both)
+    ("OKX", ["okx"]),                  # 2
+    ("GATE", ["gate", "gateio"]),      # 3
+    ("BYBIT", ["bybit"]),              # 4
+    ("TOOBIT", ["toobit"]),            # 5
+    ("MEXC", ["mexc"]),                # 6
+    ("BITGET", ["bitget"]),            # 7
+    ("WHITEBIT", ["whitebit"]),        # 8
+    ("XT", ["xt"]),                    # 9
+    ("DEEPCOIN", ["deepcoin"]),        # 10
+    ("BINGX", ["bingx"]),              # 11
+    ("BITRUE", ["bitrue"]),            # 12
+    ("HTX", ["htx", "huobi"]),         # 13
+    ("LBANK", ["lbank"]),              # 14
+    ("ASTER", ["aster"]),              # 15
+    ("KUCOIN", ["kucoin"]),            # 16 (current ccxt serves spot AND futures)
+    ("BLOFIN", ["blofin"]),            # 17
+    ("POLONIEX", ["poloniex"]),        # 18
+    ("CRYPTOCOM", ["cryptocom"]),      # 19 added 2026-11-09 (BTC/PEPE spot)
 ]
 
 # ---------------------------------------------------------------------
@@ -311,6 +315,24 @@ def parse_tf_minutes(tf):
     if n <= 0:
         raise ValueError(f"Bad timeframe '{tf}'")
     return n * mult
+
+
+# ---------------------------------------------------------------------
+# Per-asset / per-chart-timeframe signal gates (Telegram bot + history).
+# Each entry: (min spot exchanges, min futures exchanges, min CFD exchanges,
+#              min combined Weight in percent).
+# A group minimum applies only when that group really traded on the bar:
+# PEPE and ZEC have no CFD feeds, and if TradingView is unreachable the CFD
+# gate is skipped instead of blocking BTC forever. Chart timeframes that are
+# not listed fall back to the global min_exchange_count / min_confirm.
+SIGNAL_GATES = {
+    "BTC":  {"3m": (6, 6, 10, 40), "15m": (6, 6, 10, 40),
+             "30m": (4, 4, 4, 40), "45m": (4, 4, 4, 40)},
+    "PEPE": {"3m": (6, 6, 0, 40), "15m": (6, 6, 0, 40),
+             "30m": (4, 4, 0, 40), "45m": (4, 4, 0, 40)},   # no CFD feeds
+    "ZEC":  {"3m": (4, 4, 0, 40), "15m": (2, 2, 0, 20),
+             "30m": (2, 2, 0, 20), "45m": (2, 2, 0, 20)},   # no CFD feeds
+}
 
 
 @dataclass
@@ -571,8 +593,9 @@ def pairs_text(asset, info):
                      for k, t in info["pairs"].items())
 
 
-def combine(per_ex, p):
+def combine(per_ex, p, asset=None, tf=None):
     """per_ex: [(label, hist)], hist = N tuples (buy, sell, buyA, sellA), newest last.
+    asset/tf pick the per-asset/per-TF entry of SIGNAL_GATES (None = global only).
     A hist entry may be None (= that chart bar had no data, e.g. a CFD weekend
     bar); None bars are skipped and the volume SMA averages only traded bars."""
     cur_vol = {lab: (h[-1][0] + h[-1][1] if h[-1] is not None else 0.0)
@@ -682,10 +705,39 @@ def combine(per_ex, p):
             out[kind] = (x_ex, y_ex, z)
         return out
 
-    if len(buy_names) >= p.min_exchange_count and buy_counter >= p.min_confirm:
+    def gate_ok(names, counter):
+        """Global thresholds first, then the per-asset/per-TF SIGNAL_GATES
+        entry. A group minimum is only enforced when that group actually
+        traded on this bar (e.g. PEPE/ZEC have no CFD sources)."""
+        if len(names) < p.min_exchange_count or counter < p.min_confirm:
+            return False
+        g = SIGNAL_GATES.get(asset or "", {}).get(tf or "")
+        if g is None:
+            return True
+        min_s, min_f, min_c, min_pct = g
+        ns = nf = nc = 0
+        for n, _w in names:
+            if n.endswith("-S"):
+                ns += 1
+            elif n.endswith("-F"):
+                nf += 1
+            elif n.endswith(TV_CFD_SUFFIX):
+                nc += 1
+        act_s = any(n.endswith("-S") for n in active)
+        act_f = any(n.endswith("-F") for n in active)
+        act_c = any(n.endswith(TV_CFD_SUFFIX) for n in active)
+        if min_s > 0 and act_s and ns < min_s:
+            return False
+        if min_f > 0 and act_f and nf < min_f:
+            return False
+        if min_c > 0 and act_c and nc < min_c:
+            return False
+        return counter * 100 >= min_pct
+
+    if gate_ok(buy_names, buy_counter):
         res["buy"] = info(buy_names, buy_counter)
         res["buy"]["pairs"] = pair_triples(buy_names)
-    if len(sell_names) >= p.min_exchange_count and sell_counter >= p.min_confirm:
+    if gate_ok(sell_names, sell_counter):
         res["sell"] = info(sell_names, sell_counter)
         res["sell"]["pairs"] = pair_triples(sell_names)
 
@@ -797,18 +849,31 @@ def counts_line(info):
 
 
 def format_signal(side, asset, tf, ltf, B, info):
+    """Telegram text, exactly the requested shape (one market type per line,
+    triplet x/y/z = confirm / checked / confirming volume % of that group):
+        🟢 BUY  BTC/USDT  3m / 1m
+        Spot: 1/14/27
+        Futu: 5/14/79
+        CFD: 3/22/16
+        TVS: 1/18/11
+        TVF: 6/18/26
+        Weight: 19%
+        2026-11-09 10:18
+    The bottom time is the bar START in Tehran time; no timezone label."""
     head = {"BUY": "🟢 BUY", "SELL": "🔴 SELL", "GLOBAL LONG": "🔵 GLOBAL LONG",
             "GLOBAL SHORT": "🟡 GLOBAL SHORT"}[side]
-    text = f"{head}  {asset}/{asset_quote(asset)}  chart {tf} / LTF {ltf}\n"
+    lines = [f"{head}  {asset}/{asset_quote(asset)}  {tf} / {ltf}"]
     if info:
-        text += (f"{counts_line(info)} | Weight: {info['pct']}%\n"
-                 f"{', '.join(info['names'])}\n")
-        pt = pairs_text(asset, info)
-        if pt:
-            text += f"{pt}\n"
+        for name, key in (("Spot", "s"), ("Futu", "f"), ("CFD", "c"),
+                          ("TVS", "tvs"), ("TVF", "tvp")):
+            tot = info.get(f"ex_{key}_total", 0)
+            if tot:
+                lines.append(f"{name}: {info[f'ex_{key}']}/{tot}/{info.get(f'volp_{key}', 0)} ")
+        lines.append(f"Weight: {info['pct']}%")
     # B is the bar close time; display the bar START (open) time,
     # matching TradingView's bar labels
-    return text + f"Bar start: {fmt_time(B - parse_tf_minutes(tf) * MINUTE_MS)} ({TZ_LABEL})"
+    lines.append(fmt_time(B - parse_tf_minutes(tf) * MINUTE_MS) + " ")
+    return "\n".join(lines)
 
 
 def compute_history(sources, asset, p, now_ms):
@@ -836,7 +901,7 @@ def compute_history(sources, asset, p, now_ms):
                     per_ex.append((s.label, hh))
             if not per_ex:
                 continue
-            for side, info in signals_from(combine(per_ex, p)):
+            for side, info in signals_from(combine(per_ex, p, asset, tf)):
                 rows.append({
                     # display the bar START (open) time; ts stays the close time
                     "time": fmt_time(B - C_ms), "ts": B, "asset": asset, "chart_tf": tf,
@@ -1666,7 +1731,7 @@ class Engine:
                                 per_ex.append((s.label, h))
                         if not per_ex:
                             continue
-                        res = combine(per_ex, p)
+                        res = combine(per_ex, p, asset, tf)
                         log.info("%s %s bar start %s | %d sources", asset, tf, fmt_time(B - C_ms), res["used"])
                         for side, info in signals_from(res):
                             await send_telegram(p, format_signal(side, asset, tf, p.lower_tf, B, info))

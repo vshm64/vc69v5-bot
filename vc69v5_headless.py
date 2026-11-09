@@ -16,11 +16,13 @@ Configuration (environment variables, all optional):
   TV_USER / TV_PASS       free TradingView account - strongly recommended on
                           servers (fewer 429s than anonymous access)
   FIRST_RUN_TEHRAN        "YYYY-MM-DD HH:MM" - do nothing before this Iran time
-  CHART_TFS               default "3m,5m,15m"
+  CHART_TFS               default "3m,15m,30m,45m"
   LOWER_TF                default "1m"
   ASSETS                  default "BTC,PEPE,ZEC"   (XAU is excluded by design)
   DIFFERENT / MIN_VOL / VOL_SMA_LEN / MIN_CONFIRM / MIN_EXCHANGES
                           indicator inputs (defaults 5 / 69 / 20 / 0.1 / 2)
+                          NOTE: the per-asset / per-timeframe minimums live in
+                          SIGNAL_GATES inside vc69v5_app.py
   SHOW_GLOBAL             "1" to also emit GLOBAL LONG/SHORT (default off)
   FIRST_WINDOW_MIN        baseline window of the very first run (default 15)
   MAX_LOOKBACK_MIN        cap when the state is stale (default 360)
@@ -53,7 +55,7 @@ def env(name, default):
 
 
 def build_params():
-    tfs = tuple(t.strip() for t in env("CHART_TFS", "3m,5m,15m").split(",") if t.strip())
+    tfs = tuple(t.strip() for t in env("CHART_TFS", "3m,15m,30m,45m").split(",") if t.strip())
     p = app.Params(
         chart_tfs=tfs,
         lower_tf=env("LOWER_TF", "1m"),
@@ -209,7 +211,7 @@ async def one_pass(eng, p, state_path, dry):
                         per_ex.append((s.label, h))
                 if not per_ex:
                     continue
-                res = app.combine(per_ex, p)
+                res = app.combine(per_ex, p, a, tf)
                 n_bars += 1
                 log.info("%s %s bar start %s | %d sources checked",
                          a, tf, app.fmt_time(B - C_ms), res["used"])
