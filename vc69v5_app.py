@@ -918,11 +918,18 @@ def compute_history(sources, asset, p, now_ms):
                     # display the bar START (open) time; ts stays the close time
                     "time": fmt_time(B - C_ms), "ts": B, "asset": asset, "chart_tf": tf,
                     "lower_tf": p.lower_tf, "side": side,
-                    "spot_count": f"{info['ex_s']}/{info['ex_s_total']}" if info else "",
-                    "futures_count": f"{info['ex_f']}/{info['ex_f_total']}" if info else "",
-                    "cfd_count": f"{info['ex_c']}/{info['ex_c_total']}" if info else "",
-                    "tvspot_count": f"{info['ex_tvs']}/{info['ex_tvs_total']}" if info else "",
-                    "tvperp_count": f"{info['ex_tvp']}/{info['ex_tvp_total']}" if info else "",
+                    # every family as the triple x/y/z:
+                    # x = exchanges of that family confirming the signal,
+                    # y = exchanges of that family that traded on this bar,
+                    # z = confirming volume as percent of that family's volume
+                    "spot_count": f"{info['ex_s']}/{info['ex_s_total']}/{info['volp_s']}" if info else "",
+                    "futures_count": f"{info['ex_f']}/{info['ex_f_total']}/{info['volp_f']}" if info else "",
+                    "cfd_count": f"{info['ex_c']}/{info['ex_c_total']}/{info['volp_c']}" if info else "",
+                    "tvspot_count": f"{info['ex_tvs']}/{info['ex_tvs_total']}/{info['volp_tvs']}" if info else "",
+                    "tvperp_count": f"{info['ex_tvp']}/{info['ex_tvp_total']}/{info['volp_tvp']}" if info else "",
+                    # total confirming exchanges over all families (Excel shading)
+                    "confirms": (info["ex_s"] + info["ex_f"] + info["ex_c"]
+                                 + info["ex_tvs"] + info["ex_tvp"]) if info else 0,
                     "pairs": pairs_text(asset, info) if info else "",
                     "weight": info["pct"] if info else "",
                     "exchanges": ", ".join(info["names"]) if info else "",
@@ -941,11 +948,11 @@ EXCEL_COLS = [
     ("chart_tf", "chart_tf", 11),
     ("lower_tf", "lower_tf", 11),
     ("side", "side", 13),
-    ("spot_count", "spot_count", 14),
-    ("futures_count", "futures_count", 16),
-    ("cfd_count", "cfd_count", 14),
-    ("tvspot_count", "tvspot_count", 14),
-    ("tvperp_count", "tvperp_count", 16),
+    ("spot x/y/z", "spot_count", 16),
+    ("futures x/y/z", "futures_count", 18),
+    ("cfd x/y/z", "cfd_count", 16),
+    ("tvspot x/y/z", "tvspot_count", 16),
+    ("tvperp x/y/z", "tvperp_count", 18),
     ("pairs x/y/z", "pairs", 30),
     ("weight", "weight", 10),
     ("exchanges", "exchanges", 80),
@@ -953,19 +960,25 @@ EXCEL_COLS = [
 
 
 def _counts_to_text(v):
-    """'2/11' -> '2 of 11' so Excel cannot misread it as a date (CSV fallback only)."""
-    return re.sub(r"^(\d+)/(\d+)$", r"\1 of \2", str(v))
+    """'2/11/40' -> '2 of 11 (40%)' and '2/11' -> '2 of 11' so Excel/CSV cannot
+    misread them as a date (CSV fallback only)."""
+    v = re.sub(r"^(\d+)/(\d+)/(\d+)$", r"\1 of \2 (\3%)", str(v))
+    return re.sub(r"^(\d+)/(\d+)$", r"\1 of \2", v)
 
 
 def save_excel(rows, asset, p):
-    """Save the history rows as a real Excel file (.xlsx) with centered cells and
-    a first column 20 wide. Values are written as text, so Excel can no longer
-    turn entries like 2/11 into dates. Falls back to CSV without openpyxl."""
+    """Save the history rows as a real Excel file (.xlsx):
+    * navy header row with white bold text,
+    * BUY rows shaded green, SELL rows shaded red,
+    * the shade intensity follows the signal strength: the signal confirmed by
+      the most exchanges is the darkest, the weakest one the lightest.
+    Values are written as text, so Excel can no longer turn entries like 2/11
+    into dates. Falls back to CSV without openpyxl."""
     base = "history_%s_%s_%s" % (asset, "-".join(p.chart_tfs),
                                  datetime.now().strftime("%Y%m%d_%H%M%S"))
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Font
+        from openpyxl.styles import Alignment, Font, PatternFill
         from openpyxl.utils import get_column_letter
     except ImportError:
         fname = os.path.abspath(base + ".csv")
@@ -981,15 +994,38 @@ def save_excel(rows, asset, p):
     ws = wb.active
     ws.title = "history"
     center = Alignment(horizontal="center", vertical="center")
+    header_fill = PatternFill("solid", fgColor="1F3864")     # navy
     for j, (head, key, width) in enumerate(EXCEL_COLS, 1):
         c = ws.cell(row=1, column=j, value=head)
-        c.font = Font(bold=True)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = header_fill
         c.alignment = center
         ws.column_dimensions[get_column_letter(j)].width = width
+    ws.freeze_panes = "A2"
+
+    # strength shading: t = 0 weakest (lightest tint) .. 1 strongest (darkest).
+    # Strength = total confirming exchanges over all families (row 'confirms').
+    strengths = [int(r.get("confirms", 0) or 0) for r in rows]
+    lo, hi = (min(strengths), max(strengths)) if strengths else (0, 0)
+
+    def shade(side, t):
+        if side == "BUY":
+            light, dark = (234, 247, 234), (67, 160, 71)     # light green -> green
+        elif side == "SELL":
+            light, dark = (253, 236, 234), (229, 57, 53)     # light red -> red
+        else:
+            return None                                      # global rows stay white
+        mix = tuple(int(round(a + (b - a) * t)) for a, b in zip(light, dark))
+        return PatternFill("solid", fgColor="%02X%02X%02X" % mix)
+
     for i, r in enumerate(rows, 2):
+        t = ((int(r.get("confirms", 0) or 0) - lo) / (hi - lo)) if hi > lo else 0.5
+        fill = shade(r.get("side", ""), t)
         for j, (_, key, _) in enumerate(EXCEL_COLS, 1):
             c = ws.cell(row=i, column=j, value=r.get(key, ""))
             c.alignment = center
+            if fill is not None:
+                c.fill = fill
     fname = os.path.abspath(base + ".xlsx")
     wb.save(fname)
     log.info("Excel saved: %s", fname)
