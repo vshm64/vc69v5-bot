@@ -319,31 +319,30 @@ def parse_tf_minutes(tf):
 
 
 # ---------------------------------------------------------------------
-# Per-asset / per-chart-timeframe signal gates (Telegram bot + history).
-# Each entry: (min spot exchanges, min futures exchanges, min CFD exchanges,
-#              min combined Weight in percent). 0 = condition disabled.
-# Chart timeframes that are not listed fall back to the global
-# min_exchange_count / min_confirm.
+# Per-asset signal rule (Telegram bot + history), user request 2026-11-11:
+# A signal fires when ANY ONE market family (spot / futures / CFD /
+# TV-spot / TV-perp) ON ITS OWN reaches BOTH thresholds of the asset:
+#   x = confirming exchanges of that family        >= min_count
+#   z = their volume as % of THAT family's volume  >= min_weight
+# i.e. a "Spot: 6/15/40" line alone fires a BTC/PEPE signal, a
+# "Spot: 3/15/40" line alone fires ZEC - even when every other family
+# failed to confirm. The other families are never required; they are
+# only REPORTED (the message shows every family's triple anyway).
+# Small counts summed across families (e.g. 2+2+2 = 6) do NOT fire.
+# Assets not listed fall back to the global rule (>= min_exchange_count
+# sources in total AND combined weight >= min_confirm).
 #
-# DISABLED 2026-11-10 (all zeros = the ORIGINAL signal rule: a signal fires
-# when >= min_exchange_count sources confirm and their combined weight is
-# >= min_confirm). History of the values that were tried here:
-# - the first gates (>=6 spot, >=6 futures, >=10 CFD, >=40%) were
-#   mathematically unreachable - max ~2 spot / ~4 futures exchanges ever
-#   confirm on the same 3m bar, so zero signals could EVER fire.
-# - the recalibrated cross-family gates (1,1,1,15) ALSO produced zero
-#   signals on a real 3-day BTC run (user log 2026-11-10 20:40): CFD feeds
-#   almost never confirm on the same 3m bar as spot+futures, and the many
-#   TradingView sources dilute the confirming weight below the floor.
-# To get stricter signals, raise the global min_exchange_count / min_confirm
-# in the UI - those two thresholds work and are proven by months of use.
-SIGNAL_GATES = {
-    "BTC":  {"3m": (0, 0, 0, 0), "15m": (0, 0, 0, 0),
-             "30m": (0, 0, 0, 0), "45m": (0, 0, 0, 0)},
-    "PEPE": {"3m": (0, 0, 0, 0), "15m": (0, 0, 0, 0),
-             "30m": (0, 0, 0, 0), "45m": (0, 0, 0, 0)},
-    "ZEC":  {"3m": (0, 0, 0, 0), "15m": (0, 0, 0, 0),
-             "30m": (0, 0, 0, 0), "45m": (0, 0, 0, 0)},
+# History of the earlier interpretations that did NOT match this intent:
+# - per-family AND gates (6 spot AND 6 futures AND 10 CFD AND 40%):
+#   every family had to confirm on the same bar -> never fired, zero
+#   signals on real runs. DISABLED 2026-11-10.
+# - TOTAL confirming exchanges >= 6 across all families: contradicted
+#   the explicit "2+2+2 = 6 must not fire" requirement.
+SIGNAL_MIN_COUNTS = {
+    #            (min confirming exchanges, min weight % in THAT market)
+    "BTC":  (6, 40),
+    "PEPE": (6, 40),
+    "ZEC":  (3, 40),
 }
 
 
@@ -607,7 +606,9 @@ def pairs_text(asset, info):
 
 def combine(per_ex, p, asset=None, tf=None):
     """per_ex: [(label, hist)], hist = N tuples (buy, sell, buyA, sellA), newest last.
-    asset/tf pick the per-asset/per-TF entry of SIGNAL_GATES (None = global only).
+    asset picks the per-asset rule from SIGNAL_MIN_COUNTS (None or unlisted =
+    global Params.min_exchange_count / min_confirm); tf is accepted for call
+    compatibility but the rule is per asset only.
     A hist entry may be None (= that chart bar had no data, e.g. a CFD weekend
     bar); None bars are skipped and the volume SMA averages only traded bars."""
     cur_vol = {lab: (h[-1][0] + h[-1][1] if h[-1] is not None else 0.0)
@@ -718,33 +719,24 @@ def combine(per_ex, p, asset=None, tf=None):
         return out
 
     def gate_ok(names, counter):
-        """Global thresholds first, then the per-asset/per-TF SIGNAL_GATES
-        entry. A group minimum is only enforced when that group actually
-        traded on this bar (e.g. PEPE/ZEC have no CFD sources)."""
-        if len(names) < p.min_exchange_count or counter < p.min_confirm:
-            return False
-        g = SIGNAL_GATES.get(asset or "", {}).get(tf or "")
-        if g is None:
-            return True
-        min_s, min_f, min_c, min_pct = g
-        ns = nf = nc = 0
-        for n, _w in names:
-            if n.endswith("-S"):
-                ns += 1
-            elif n.endswith("-F"):
-                nf += 1
-            elif n.endswith(TV_CFD_SUFFIX):
-                nc += 1
-        act_s = any(n.endswith("-S") for n in active)
-        act_f = any(n.endswith("-F") for n in active)
-        act_c = any(n.endswith(TV_CFD_SUFFIX) for n in active)
-        if min_s > 0 and act_s and ns < min_s:
-            return False
-        if min_f > 0 and act_f and nf < min_f:
-            return False
-        if min_c > 0 and act_c and nc < min_c:
-            return False
-        return counter * 100 >= min_pct
+        """User rule 2026-11-11: for assets listed in SIGNAL_MIN_COUNTS, ANY
+        ONE market family that on its own has (x >= min_count confirming
+        exchanges AND z >= min_weight percent of THAT family's traded volume)
+        fires the signal - the other families are reported but not required
+        (2+2+2 across families never fires). Assets not listed use the
+        global rule (>= min_exchange_count sources in total AND combined
+        weight >= min_confirm)."""
+        spec = SIGNAL_MIN_COUNTS.get(asset or "")
+        if spec is None:
+            return len(names) >= p.min_exchange_count and counter >= p.min_confirm
+        need_n, need_w = spec
+        d = info(names, counter)
+        for key in ("s", "f", "c", "tvs", "tvp"):
+            if d.get(f"ex_{key}_total", 0) <= 0:
+                continue                    # family did not trade on this bar
+            if d[f"ex_{key}"] >= need_n and d.get(f"volp_{key}", 0) >= need_w:
+                return True
+        return False
 
     if gate_ok(buy_names, buy_counter):
         res["buy"] = info(buy_names, buy_counter)
