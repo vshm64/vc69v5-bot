@@ -70,6 +70,7 @@ import asyncio
 import copy
 import csv
 import logging
+import math
 import os
 import queue
 import re
@@ -320,18 +321,29 @@ def parse_tf_minutes(tf):
 # ---------------------------------------------------------------------
 # Per-asset / per-chart-timeframe signal gates (Telegram bot + history).
 # Each entry: (min spot exchanges, min futures exchanges, min CFD exchanges,
-#              min combined Weight in percent).
-# A group minimum applies only when that group really traded on the bar:
-# PEPE and ZEC have no CFD feeds, and if TradingView is unreachable the CFD
-# gate is skipped instead of blocking BTC forever. Chart timeframes that are
-# not listed fall back to the global min_exchange_count / min_confirm.
+#              min combined Weight in percent). 0 = condition disabled.
+# Chart timeframes that are not listed fall back to the global
+# min_exchange_count / min_confirm.
+#
+# DISABLED 2026-11-10 (all zeros = the ORIGINAL signal rule: a signal fires
+# when >= min_exchange_count sources confirm and their combined weight is
+# >= min_confirm). History of the values that were tried here:
+# - the first gates (>=6 spot, >=6 futures, >=10 CFD, >=40%) were
+#   mathematically unreachable - max ~2 spot / ~4 futures exchanges ever
+#   confirm on the same 3m bar, so zero signals could EVER fire.
+# - the recalibrated cross-family gates (1,1,1,15) ALSO produced zero
+#   signals on a real 3-day BTC run (user log 2026-11-10 20:40): CFD feeds
+#   almost never confirm on the same 3m bar as spot+futures, and the many
+#   TradingView sources dilute the confirming weight below the floor.
+# To get stricter signals, raise the global min_exchange_count / min_confirm
+# in the UI - those two thresholds work and are proven by months of use.
 SIGNAL_GATES = {
-    "BTC":  {"3m": (6, 6, 10, 40), "15m": (6, 6, 10, 40),
-             "30m": (4, 4, 4, 40), "45m": (4, 4, 4, 40)},
-    "PEPE": {"3m": (6, 6, 0, 40), "15m": (6, 6, 0, 40),
-             "30m": (4, 4, 0, 40), "45m": (4, 4, 0, 40)},   # no CFD feeds
-    "ZEC":  {"3m": (4, 4, 0, 40), "15m": (2, 2, 0, 20),
-             "30m": (2, 2, 0, 20), "45m": (2, 2, 0, 20)},   # no CFD feeds
+    "BTC":  {"3m": (0, 0, 0, 0), "15m": (0, 0, 0, 0),
+             "30m": (0, 0, 0, 0), "45m": (0, 0, 0, 0)},
+    "PEPE": {"3m": (0, 0, 0, 0), "15m": (0, 0, 0, 0),
+             "30m": (0, 0, 0, 0), "45m": (0, 0, 0, 0)},
+    "ZEC":  {"3m": (0, 0, 0, 0), "15m": (0, 0, 0, 0),
+             "30m": (0, 0, 0, 0), "45m": (0, 0, 0, 0)},
 }
 
 
@@ -1049,6 +1061,76 @@ async def load_markets_resilient(ex, timeout):
     return "partial: " + " + ".join(ok_parts) + " only"
 
 
+# ---------------------------------------------------------------------
+# Swap volume unit calibration (2026-11 bugfix)
+# ---------------------------------------------------------------------
+# ccxt fetch_ohlcv() returns SWAP volume in DIFFERENT units per exchange:
+# plain coin units (okx, htx, bitget, whitebit), units of the '1000PEPE'
+# contract symbol (binance, bybit, bingx, toobit, deepcoin) or raw contracts
+# (gate, kucoin, xt, poloniex). The legacy factor contractSize*mult was wrong
+# for the coin-unit group and inflated e.g. OKX by 1e7x and HTX by 1e6x - one
+# exchange then held ~100% of the total volume, the weight half of the signal
+# gate (>=40%) could never pass and NO signal ever fired (both in the app and
+# in the GitHub bot). Fix: SWAP_UNIT_FACTOR[(exchange id, asset)] is measured
+# ONCE at startup by comparing a few hours of raw swap candles against the
+# SAME exchange's spot candles (spot volume in ccxt is always plain coin
+# units). Among the candidates {1, mult, contractSize*mult} the one whose
+# implied futures/spot ratio is geometrically closest to 1 wins. Without a
+# spot anchor (futures-only exchanges) the legacy factor is kept.
+SWAP_UNIT_FACTOR = {}
+SWAP_UNIT_SEED = {"okx": 1.0, "htx": 1.0}   # measured 2026-11: ccxt returns coin units
+CAL_SINCE_H = 6          # calibration window in hours (both markets identical)
+CAL_BARS = 400
+
+
+def _pre_mult(base, asset):
+    """'1000PEPE' -> 1000, 'PEPE' -> 1 (same rule as find_markets)."""
+    if base.endswith(asset) and len(base) > len(asset):
+        pre = base[: len(base) - len(asset)]
+        if pre.isdigit() and int(pre) > 0:
+            return int(pre)
+    return 1
+
+
+async def calibrate_swap_units(ex, assets):
+    """Measure the true OHLCV volume unit of every swap market of `assets`.
+    Anchor: the exchange's own SPOT candles. Best-effort: on any error the
+    legacy contractSize*mult factor stays in place."""
+    for asset in assets:
+        try:
+            fm = find_markets(ex, asset)
+            if not fm["futures"]:
+                continue
+            sym = fm["futures"][0]
+            m = ex.markets.get(sym) or {}
+            base = m.get("base") or ""
+            mult = _pre_mult(base, asset)
+            cs = float(m.get("contractSize") or 1)
+            legacy = cs * mult
+            since = int(time.time() * 1000) - CAL_SINCE_H * 3600 * 1000
+            rows = await ex.fetch_ohlcv(sym, "1m", since=since, limit=CAL_BARS)
+            raw = sum(r[5] for r in rows if r and r[5] is not None)
+            if raw <= 0:
+                continue
+            cand = sorted({1.0, float(mult), legacy})
+            factor = legacy
+            if fm["spot"]:
+                srows = await ex.fetch_ohlcv(fm["spot"][0], "1m", since=since,
+                                             limit=CAL_BARS)
+                spot_vol = sum(r[5] for r in srows if r and r[5] is not None)
+                if spot_vol > 0:
+                    # geometrically closest to a futures/spot ratio of 1
+                    factor = min(cand, key=lambda c: abs(
+                        math.log10(max(c * raw / spot_vol, 1e-12))))
+            SWAP_UNIT_FACTOR[(ex.id, asset)] = factor
+            if factor != legacy:
+                log.info("%s: %s swap volume factor calibrated to %g "
+                         "(legacy %g was wrong)", ex.id, asset, factor, legacy)
+        except Exception as e:  # noqa: BLE001
+            log.info("%s: %s swap calibration skipped (%s)",
+                     ex.id, asset, str(e)[:60])
+
+
 def find_markets(ex, asset, use_spot=True, use_futures=True):
     """Spot market and USDT-linear perpetual of `asset`; factor converts volume to coin units."""
     out = {"spot": None, "futures": None}
@@ -1066,7 +1148,10 @@ def find_markets(ex, asset, use_spot=True, use_futures=True):
                 mult = int(pre) if pre else 1
                 if best_mult is None or mult < best_mult:
                     best_mult = mult
-                    out["futures"] = (sym, float(m.get("contractSize") or 1) * mult)
+                    out["futures"] = (sym, SWAP_UNIT_FACTOR.get(
+                        (ex.id, asset),
+                        SWAP_UNIT_SEED.get(ex.id,
+                                           float(m.get("contractSize") or 1) * mult)))
     return out
 
 
@@ -1355,6 +1440,11 @@ class Engine:
                                 await probe_timeframes(ex)
                             except Exception:  # noqa: BLE001
                                 pass          # probe is best-effort; 1m fallback stays safe
+                            try:
+                                await calibrate_swap_units(
+                                    ex, [a for a in ASSETS if a != "XAU"])
+                            except Exception:  # noqa: BLE001
+                                pass          # calibration is best-effort too
                             return
                         except Exception as e:  # noqa: BLE001
                             err = e
