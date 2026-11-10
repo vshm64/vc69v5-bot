@@ -1,9 +1,19 @@
 name: vc69v5-signals
 
-# Reliable ~15-minute cadence WITHOUT GitHub's flaky "schedule" trigger.
-# Every run re-dispatches itself via workflow_dispatch (never skipped).
+# Reliable 15-minute cadence WITHOUT GitHub's flaky "schedule" trigger.
+# Runs are kept on the quarter-hour boundaries :00/:15/:30/:45
+# (identical in Tehran time, UTC+3:30 is a quarter-hour offset).
+# GitHub skips/delays most scheduled runs on quiet repos (observed: 3 runs
+# in ~20 hours!). Instead, EVERY run re-dispatches itself via the
+# workflow_dispatch API at the end (dispatch runs are NEVER skipped -
+# same as the manual "Run workflow" button). GitHub docs explicitly
+# allow GITHUB_TOKEN to call workflow_dispatch (it is the documented
+# exception to the "events do not trigger workflows" rule).
+#
 # Start the chain:  Actions tab -> vc69v5-signals -> "Run workflow" (once).
 # Stop the chain:   Actions tab -> "..." -> "Disable workflow".
+# If the chain ever dies (long outage, cancelled run): just click
+# "Run workflow" once again.
 
 on:
   workflow_dispatch:        # manual button + the self-chain trigger
@@ -38,9 +48,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Record start time
-        run: echo "START_S=$(date +%s)" >> "$GITHUB_ENV"
-
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -56,18 +63,20 @@ jobs:
           git pull --rebase origin ${GITHUB_REF_NAME} || true
           git push
 
-      # Chain link: sleep until the next 15-min boundary, then dispatch
-      # the next run. Runs even if a previous step FAILED.
-      - name: Chain - wait for next 15-min tick, then re-trigger
+      # Chain link: sleep until the NEXT quarter-hour WALL-CLOCK boundary
+      # (:00/:15/:30/:45), then dispatch the next run so it starts right on
+      # the boundary - freshly closed candles are checked within ~5 minutes.
+      # Runs even if a previous step FAILED (but not on cancel).
+      - name: Chain - wait for next quarter-hour, then re-trigger
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          LEFT=$(( 900 - $(date +%s) + ${START_S:-$(date +%s)} ))
-          if [ "$LEFT" -lt 10 ];  then LEFT=10;  fi
-          if [ "$LEFT" -gt 840 ]; then LEFT=840; fi
-          echo "waiting ${LEFT}s before triggering the next run"
+          NOW=$(date +%s)
+          LEFT=$(( (NOW / 900 + 1) * 900 - NOW ))
+          if [ "$LEFT" -lt 60 ]; then LEFT=$(( LEFT + 900 )); fi
+          echo "waiting ${LEFT}s until the next quarter-hour boundary"
           sleep "$LEFT"
           for i in 1 2 3; do
             gh workflow run signals.yml --ref main && exit 0
