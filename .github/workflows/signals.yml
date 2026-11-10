@@ -1,27 +1,31 @@
 name: vc69v5-signals
 
+# Reliable ~15-minute cadence WITHOUT GitHub's flaky "schedule" trigger.
+# Every run re-dispatches itself via workflow_dispatch (never skipped).
+# Start the chain:  Actions tab -> vc69v5-signals -> "Run workflow" (once).
+# Stop the chain:   Actions tab -> "..." -> "Disable workflow".
+
 on:
-  schedule:
-    - cron: "7,22,37,52 * * * *"
-  workflow_dispatch:        # manual "Run workflow" button for testing
+  workflow_dispatch:        # manual button + the self-chain trigger
 
 permissions:
   contents: write           # needed to commit the state file back
+  actions: write            # needed to re-trigger the next run
 
 concurrency:
   group: vc69v5-signals
-  cancel-in-progress: true  # never overlap two runs
+  cancel-in-progress: false # a queued run never kills the running one
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 22
     env:
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
       TV_USER: ${{ secrets.TV_USER }}
       TV_PASS: ${{ secrets.TV_PASS }}
-      FIRST_RUN_TEHRAN: "2026-11-08 13:30"   # first check: 13:30 Tehran (in the past = no waiting)
+      FIRST_RUN_TEHRAN: "2026-11-08 13:30"   # first check: 13:30 Tehran (past = no waiting)
       CHART_TFS: "3m,15m,30m,45m"            # chart timeframes
       LOWER_TF: "1m"                         # lower timeframe
       ASSETS: "BTC,PEPE,ZEC"                 # BTC/PEPE/ZEC only (spot+futures, ccxt+TV)
@@ -33,6 +37,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Record start time
+        run: echo "START_S=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -48,3 +55,24 @@ jobs:
           git diff --cached --quiet || git commit -m "state: $(date -u '+%Y-%m-%d %H:%M UTC')"
           git pull --rebase origin ${GITHUB_REF_NAME} || true
           git push
+
+      # Chain link: sleep until the next 15-min boundary, then dispatch
+      # the next run. Runs even if a previous step FAILED.
+      - name: Chain - wait for next 15-min tick, then re-trigger
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          LEFT=$(( 900 - $(date +%s) + ${START_S:-$(date +%s)} ))
+          if [ "$LEFT" -lt 10 ];  then LEFT=10;  fi
+          if [ "$LEFT" -gt 840 ]; then LEFT=840; fi
+          echo "waiting ${LEFT}s before triggering the next run"
+          sleep "$LEFT"
+          for i in 1 2 3; do
+            gh workflow run signals.yml --ref main && exit 0
+            echo "dispatch failed (try $i/3) - retrying in 20s"
+            sleep 20
+          done
+          echo "could not dispatch the next run - chain stops, restart manually" >&2
+          exit 1
