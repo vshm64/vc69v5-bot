@@ -340,9 +340,9 @@ def parse_tf_minutes(tf):
 #   the explicit "2+2+2 = 6 must not fire" requirement.
 SIGNAL_MIN_COUNTS = {
     #            (min confirming exchanges, min weight % in THAT market)
-    "BTC":  (6, 40),
-    "PEPE": (6, 40),
-    "ZEC":  (3, 40),
+    "BTC":  (2, 10),
+    "PEPE": (2, 10),
+    "ZEC":  (2, 10),
 }
 
 
