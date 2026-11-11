@@ -20,9 +20,24 @@ Configuration (environment variables, all optional):
   LOWER_TF                default "1m"
   ASSETS                  default "BTC,PEPE,ZEC"   (XAU is excluded by design)
   DIFFERENT / MIN_VOL / VOL_SMA_LEN / MIN_CONFIRM / MIN_EXCHANGES
-                          indicator inputs (defaults 5 / 69 / 20 / 0.1 / 2)
-                          NOTE: the per-asset / per-timeframe minimums live in
-                          SIGNAL_GATES inside vc69v5_app.py
+                          indicator inputs (defaults 5 / 69 / 20 / 0.1 / 2;
+                          MIN_EXCHANGES/MIN_CONFIRM apply to assets WITHOUT
+                          a per-asset rule)
+                          NOTE: the per-asset signal rules live in
+                          SIGNAL_MIN_COUNTS inside vc69v5_app.py - a signal
+                          fires when ANY ONE market family (spot/futures/
+                          CFD/TV-spot/TV-perp) on its own has BTC & PEPE:
+                          6 confirming exchanges AND 40% of that family's
+                          volume, ZEC: 3 AND 40%.
+  SIGNAL_MIN_COUNTS       optional override of that rule list, format
+                          "ASSET=COUNT[/WEIGHT%]", e.g.
+                          "BTC=6/40,PEPE=6/40,ZEC=3/40". A signal fires when
+                          ANY ONE market family on its own reaches BOTH
+                          numbers; WEIGHT defaults to 40. Setting the
+                          variable REPLACES the whole rule list; the value
+                          "none" disables every per-asset rule (all assets
+                          then use MIN_EXCHANGES/MIN_CONFIRM). The effective
+                          rules are printed in the first "settings:" log line.
   SHOW_GLOBAL             "1" to also emit GLOBAL LONG/SHORT (default off)
   FIRST_WINDOW_MIN        baseline window of the very first run (default 15)
   MAX_LOOKBACK_MIN        cap when the state is stale (default 360)
@@ -35,6 +50,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -48,6 +64,10 @@ TEHRAN = app.TZ
 MINUTE_MS = app.MINUTE_MS
 STATE_VERSION = 1
 
+# import-time snapshot of the per-asset rules coded in vc69v5_app.py -
+# apply_signal_rules() restores it whenever the env variable is unset
+_DEFAULT_SIGNAL_MIN_COUNTS = dict(app.SIGNAL_MIN_COUNTS)
+
 
 def env(name, default):
     v = os.environ.get(name)
@@ -55,6 +75,7 @@ def env(name, default):
 
 
 def build_params():
+    apply_signal_rules()
     tfs = tuple(t.strip() for t in env("CHART_TFS", "3m,15m,30m,45m").split(",") if t.strip())
     p = app.Params(
         chart_tfs=tfs,
@@ -72,6 +93,61 @@ def build_params():
     )
     p.validate()
     return p
+
+
+# --------------------------------------------------- per-asset rule override
+def rules_text():
+    """'BTC=6/40 PEPE=6/40 ZEC=3/40' (for the settings log line) - or
+    'none(global-rule)' when the per-asset list is empty."""
+    return " ".join(f"{a}={n}/{w}"
+                    for a, (n, w) in app.SIGNAL_MIN_COUNTS.items()) \
+        or "none(global-rule)"
+
+
+def apply_signal_rules():
+    """Optional env override for SIGNAL_MIN_COUNTS in vc69v5_app.py.
+
+    SIGNAL_MIN_COUNTS="BTC=6/40,PEPE=6/40,ZEC=3/40"
+      ASSET=COUNT[/WEIGHT%]: a signal fires when ANY ONE market family
+      (spot / futures / CFD / TV-spot / TV-perp) ON ITS OWN has >= COUNT
+      confirming exchanges AND >= WEIGHT% of that family's traded volume;
+      WEIGHT defaults to 40 when omitted. Setting the variable REPLACES the
+      whole rule list; "none" clears it (every asset falls back to the
+      global MIN_EXCHANGES/MIN_CONFIRM rule). Unset = the defaults coded in
+      vc69v5_app.py stay active.
+    """
+    raw = env("SIGNAL_MIN_COUNTS", "")
+    if not raw.strip():
+        app.SIGNAL_MIN_COUNTS.clear()
+        app.SIGNAL_MIN_COUNTS.update(_DEFAULT_SIGNAL_MIN_COUNTS)
+        return
+    if raw.strip().lower() == "none":
+        app.SIGNAL_MIN_COUNTS.clear()
+        log.info("SIGNAL_MIN_COUNTS env = none - every asset uses the "
+                 "global MIN_EXCHANGES/MIN_CONFIRM rule")
+        return
+    rules = {}
+    for part in raw.split(","):
+        part = part.strip()
+        m = re.fullmatch(r"([A-Za-z]{2,6})\s*=\s*(\d+)(?:\s*/\s*(\d+))?", part)
+        if not m:
+            raise SystemExit(f"Bad SIGNAL_MIN_COUNTS item '{part}' - use "
+                             "ASSET=COUNT[/WEIGHT], e.g. "
+                             "'BTC=6/40,PEPE=6/40,ZEC=3/40'")
+        a, n, w = m.group(1).upper(), int(m.group(2)), m.group(3)
+        if a not in app.ASSETS:
+            raise SystemExit(f"SIGNAL_MIN_COUNTS: unknown asset '{a}' - "
+                             f"choose from {', '.join(app.ASSETS)}")
+        if n < 1:
+            raise SystemExit(f"SIGNAL_MIN_COUNTS: COUNT for {a} must be >= 1")
+        w = int(w) if w is not None else 40
+        if not 1 <= w <= 100:
+            raise SystemExit(f"SIGNAL_MIN_COUNTS: WEIGHT for {a} must be "
+                             "1..100")
+        rules[a] = (n, w)
+    app.SIGNAL_MIN_COUNTS.clear()
+    app.SIGNAL_MIN_COUNTS.update(rules)
+    log.info("SIGNAL_MIN_COUNTS env applied: %s", rules_text())
 
 
 # --------------------------------------------------------------------- state
@@ -251,9 +327,9 @@ def main():
     logging.getLogger("vc69v5.headless").setLevel(logging.INFO)
     p = build_params()
     log.info("settings: different=%d min_vol=%d vol_sma_len=%d min_confirm=%.2f "
-             "min_exchanges=%d | telegram=%s | tv_login=%s",
+             "min_exchanges=%d | signal_rules: %s | telegram=%s | tv_login=%s",
              p.different, p.min_vol, p.vol_sma_len, p.min_confirm,
-             p.min_exchange_count,
+             p.min_exchange_count, rules_text(),
              "on" if (p.tg_token and p.tg_chat) and not args.dry_run else "OFF",
              "yes" if p.tv_user and p.tv_pass else "anonymous")
 
