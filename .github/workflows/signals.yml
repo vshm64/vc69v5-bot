@@ -38,7 +38,7 @@ jobs:
       # login - the ccxt spot/futures families keep working regardless.
       TV_USER: ${{ secrets.TV_USER }}
       TV_PASS: ${{ secrets.TV_PASS }}
-      FIRST_RUN_TEHRAN: "2026-11-08 13:30"   # first check: 13:30 Tehran (past = no waiting)
+      FIRST_RUN_TEHRAN: "2026-11-11 13:02"   # first check: 13:30 Tehran (past = no waiting)
       CHART_TFS: "3m,15m,30m,45m"            # chart timeframes
       LOWER_TF: "1m"                         # lower timeframe
       ASSETS: "BTC,PEPE,ZEC"                 # BTC/PEPE/ZEC only (spot+futures, ccxt+TV)
