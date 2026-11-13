@@ -26,8 +26,7 @@ test_message_id = 2
 [tradingview]
 # روی GitHub آی‌پی سرورها توسط TradingView بسته است؛ روشن‌کردن فقط اجرا را کند می‌کند.
 # اگر روشن کنید باید TV_USER و TV_PASS را هم در Secrets بگذارید (اختیاری).
-enabled = false
-
+enabled = true
 [exchanges]
 # صرافی‌هایی که نمی‌خواهید استفاده شوند، مثلاً ["BINANCE", "BYBIT"]
 exclude = []
@@ -63,25 +62,25 @@ show_global_signals = false  # سیگنال GLOBAL LONG / SHORT
 enabled = true
 chart_timeframes = ["3m", "15m", "30m", "45m"]
 lower_timeframe = "1m"
-spot    = { exchanges = 3, weight = 20 }
-futures = { exchanges = 3, weight = 20 }
-cfd     = { exchanges = 2, weight = 20 }
-total_weight = 30
+spot    = { exchanges = 2, weight = 10 }
+futures = { exchanges = 2, weight = 10 }
+cfd     = { exchanges = 2, weight = 10 }
+total_weight = 10
 
 [PEPE]
 enabled = true
 chart_timeframes = ["3m", "15m", "30m", "45m"]
 lower_timeframe = "1m"
-spot    = { exchanges = 3, weight = 20 }
-futures = { exchanges = 3, weight = 20 }
+spot    = { exchanges = 2, weight = 10 }
+futures = { exchanges = 2, weight = 10 }
 cfd     = { exchanges = 0, weight = 0 }
-total_weight = 30
+total_weight = 10
 
 [ZEC]
 enabled = true
 chart_timeframes = ["3m", "15m", "30m", "45m"]
 lower_timeframe = "1m"
-spot    = { exchanges = 2, weight = 20 }
-futures = { exchanges = 2, weight = 20 }
+spot    = { exchanges = 2, weight = 10 }
+futures = { exchanges = 2, weight = 10 }
 cfd     = { exchanges = 0, weight = 0 }
-total_weight = 30
+total_weight = 10
