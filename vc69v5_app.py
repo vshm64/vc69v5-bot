@@ -3,9 +3,10 @@
 VC69V5 - desktop app (Python port of the TradingView indicator by kheirandish_v)
 
 * A settings window with the same inputs as the indicator.
-* "Check history": scans the past N days of ONE coin (BTC / PEPE / ZEC / XAU) and lists
-  every signal in a table, saves an Excel file (.xlsx) and (optionally) sends a summary
-  to Telegram.
+* "Check history": scans the past N days of ONE coin (BTC / PEPE / ZEC / XAU) or, with
+  the dropdown option "ALL", of every coin (XAU only when the CFD feeds are enabled;
+  one Excel file per coin). Lists every signal in a table, saves Excel file(s) (.xlsx)
+  and (optionally) sends a summary to Telegram.
 * "Start live": runs the indicator on BTC, PEPE, ZEC and XAU at the same time, using the
   same settings; signals go to Telegram and the log.
 * Every crypto exchange contributes two sources: spot and USDT-perpetual futures.
@@ -340,9 +341,9 @@ def parse_tf_minutes(tf):
 #   the explicit "2+2+2 = 6 must not fire" requirement.
 SIGNAL_MIN_COUNTS = {
     #            (min confirming exchanges, min weight % in THAT market)
-    "BTC":  (2, 10),
-    "PEPE": (2, 10),
-    "ZEC":  (2, 10),
+    "BTC":  (6, 40),
+    "PEPE": (6, 40),
+    "ZEC":  (3, 40),
 }
 
 
@@ -371,6 +372,7 @@ class Params:
     proxy: str = ""
     tv_user: str = ""                      # optional free TradingView account
     tv_pass: str = ""
+    live_assets: tuple = ()                # coins for 'Start live' (empty = ALL)
 
     def validate(self):
         if not self.chart_tfs:
@@ -401,9 +403,14 @@ class Params:
             raise ValueError("Select at least one of spot/futures/CFD/TV spot/TV perpetual")
         if self.history_asset == "XAU" and not self.use_cfd:
             raise ValueError("XAU history needs the CFD brokers (TradingView) enabled")
+        if self.live_assets:
+            if any(a not in ASSETS for a in self.live_assets):
+                raise ValueError("Unknown live coin")
+            if "XAU" in self.live_assets and not self.use_cfd:
+                raise ValueError("XAU live needs the CFD brokers (TradingView) enabled")
         if not self.exchanges:
             raise ValueError("Select at least one exchange")
-        if self.history_asset not in ASSETS:
+        if self.history_asset != "ALL" and self.history_asset not in ASSETS:
             raise ValueError("Unknown history coin")
         if self.history_days < 1:
             raise ValueError("History days must be >= 1")
@@ -604,11 +611,16 @@ def pairs_text(asset, info):
                      for k, t in info["pairs"].items())
 
 
-def combine(per_ex, p, asset=None, tf=None):
+def combine(per_ex, p, asset=None, tf=None, rules=None):
     """per_ex: [(label, hist)], hist = N tuples (buy, sell, buyA, sellA), newest last.
     asset picks the per-asset rule from SIGNAL_MIN_COUNTS (None or unlisted =
     global Params.min_exchange_count / min_confirm); tf is accepted for call
     compatibility but the rule is per asset only.
+    rules (headless bot): {"SPOT": (n, w), "PERP": (n, w), "CFD": (n, w), "overall": W}.
+    A signal fires when ANY market family (spot = ccxt+TV spot, perp = ccxt futures
+    + TV perpetual, CFD) has >= n confirming exchanges holding >= w % of THAT
+    family's traded volume (n = 0 disables the family) AND - unless W = 0 - the
+    confirming sources hold >= W % of the volume traded across ALL families.
     A hist entry may be None (= that chart bar had no data, e.g. a CFD weekend
     bar); None bars are skipped and the volume SMA averages only traded bars."""
     cur_vol = {lab: (h[-1][0] + h[-1][1] if h[-1] is not None else 0.0)
@@ -726,6 +738,21 @@ def combine(per_ex, p, asset=None, tf=None):
         (2+2+2 across families never fires). Assets not listed use the
         global rule (>= min_exchange_count sources in total AND combined
         weight >= min_confirm)."""
+        if rules is not None:
+            trip = pair_triples(names)
+            fam_ok = False
+            for kind in ("SPOT", "PERP", "CFD"):
+                t = trip.get(kind)
+                r = rules.get(kind)
+                if t is None or not r or r[0] <= 0 or t[1] <= 0:
+                    continue
+                if t[0] >= r[0] and t[2] >= r[1]:
+                    fam_ok = True
+                    break
+            if not fam_ok:
+                return False
+            total_need = rules.get("overall", 0) or 0
+            return total_need <= 0 or round(counter * 100) >= total_need
         spec = SIGNAL_MIN_COUNTS.get(asset or "")
         if spec is None:
             return len(names) >= p.min_exchange_count and counter >= p.min_confirm
@@ -746,6 +773,9 @@ def combine(per_ex, p, asset=None, tf=None):
         res["sell"]["pairs"] = pair_triples(sell_names)
 
     res["used"] = len(active)         # sources that really traded on this bar
+    # near-miss data for threshold tuning: per-family (x, y, z) and overall % per side
+    res["probe"] = {"buy": (pair_triples(buy_names), round(buy_counter * 100)),
+                    "sell": (pair_triples(sell_names), round(sell_counter * 100))}
 
     if p.show_global and total_vol > 0:
         total_hist = []
@@ -878,6 +908,23 @@ def format_signal(side, asset, tf, ltf, B, info):
     # matching TradingView's bar labels
     lines.append(fmt_time(B - parse_tf_minutes(tf) * MINUTE_MS) + " ")
     return "\n".join(lines)
+
+
+def history_assets_for(p):
+    """Coins scanned by 'Check history': one coin, or every coin when the
+    History dropdown is set to ALL (XAU only when the CFD feeds are enabled -
+    it has no ccxt sources)."""
+    if p.history_asset != "ALL":
+        return [p.history_asset]
+    return [a for a in ASSETS if a != "XAU" or p.use_cfd]
+
+
+def live_assets_for(p):
+    """Coins monitored by 'Start live'. The Live dropdown selects one coin or
+    ALL (empty live_assets = ALL, the old behaviour); XAU only when the CFD
+    feeds are enabled - it has no ccxt sources."""
+    chosen = p.live_assets or tuple(ASSETS)
+    return [a for a in chosen if a != "XAU" or p.use_cfd]
 
 
 def compute_history(sources, asset, p, now_ms):
@@ -1653,14 +1700,35 @@ class Engine:
             self.ui("hist_state", False)
 
     async def run_history(self, p):
-        asset = p.history_asset
+        assets = history_assets_for(p)
+        if p.history_asset == "ALL" and "XAU" not in assets:
+            log.warning("ALL: XAU is skipped - the CFD brokers (TradingView) "
+                        "are disabled and XAU has no other sources")
         log.info("=== HISTORY %s | chart %s | LTF %s | last %d days ===",
-                 asset, ",".join(p.chart_tfs), p.lower_tf, p.history_days)
+                 "/".join(assets), ",".join(p.chart_tfs), p.lower_tf, p.history_days)
         await self.ensure_exchanges(p.exchanges, p.proxy)
+        results = []                              # (asset, rows, fname)
+        for i, asset in enumerate(assets):
+            if len(assets) > 1:
+                log.info("--- coin %d/%d: %s ---", i + 1, len(assets), asset)
+            res = await self._history_one(asset, p)
+            if res is not None:
+                results.append((asset, *res))
+        if len(results) > 1:
+            n_all = sum(len(rows) for _, rows, _ in results)
+            log.info("History done for %d coin(s): %d signals in total",
+                     len(results), n_all)
+        if p.tg_history and results:
+            await self._history_telegram(p, results)
+
+    async def _history_one(self, asset, p):
+        """Scan ONE coin for 'Check history': download the sources, compute the
+        signals of the last p.history_days days, save the Excel file and fill
+        the history table. Returns (rows, fname) or None without sources."""
         lst = self.build_sources([asset], p)[asset]
         if not lst:
             log.error("No sources found for %s", asset)
-            return
+            return None
         L_min = parse_tf_minutes(p.lower_tf)
         c_max = max(parse_tf_minutes(t) for t in p.chart_tfs)
         needed_min = p.history_days * 1440 + (p.vol_sma_len + 1) * c_max + L_min + 5
@@ -1689,33 +1757,68 @@ class Engine:
         n_buy = sum(1 for r in rows if r["side"] == "BUY")
         n_sell = sum(1 for r in rows if r["side"] == "SELL")
         n_glob = len(rows) - n_buy - n_sell
-        log.info("History done: %d signals (BUY %d, SELL %d, global %d)", len(rows), n_buy, n_sell, n_glob)
+        log.info("History done: %s %d signals (BUY %d, SELL %d, global %d)",
+                 asset, len(rows), n_buy, n_sell, n_glob)
         fname = save_excel(rows, asset, p)
         self.ui("hist_rows", rows)
-        if p.tg_history:
+        return rows, fname
+
+    @staticmethod
+    def _hist_line(r, with_asset=False):
+        """One 'Latest signals' line for the Telegram summary."""
+        parts = []
+        if r["spot_count"]:
+            parts.append(f"spot {r['spot_count']}")
+        if r["futures_count"]:
+            parts.append(f"fut {r['futures_count']}")
+        if r["cfd_count"]:
+            parts.append(f"cfd {r['cfd_count']}")
+        if r["tvspot_count"]:
+            parts.append(f"tvspot {r['tvspot_count']}")
+        if r["tvperp_count"]:
+            parts.append(f"tvperp {r['tvperp_count']}")
+        if r["weight"] != "":
+            parts.append(f"{r['weight']}%")
+        w_txt = (" " + " | ".join(parts)) if parts else ""
+        a = f"{r['asset']} " if with_asset else ""
+        return f"{r['time']} {a}{r['chart_tf']} {r['side']}{w_txt}"
+
+    async def _history_telegram(self, p, results):
+        """results: [(asset, rows, fname), ...] from run_history. One coin keeps
+        the familiar single-coin message; ALL sends one combined message with a
+        per-coin section and the 10 newest signals over all coins."""
+        multi = len(results) > 1
+        lines = []
+        if multi:
+            lines.append(f"📊 VC69V5 history | ALL ({len(results)} coins)")
+            lines.append(f"chart {','.join(p.chart_tfs)} / LTF {p.lower_tf} | "
+                         f"last {p.history_days} days | times {TZ_LABEL}")
+            for asset, rows, fname in results:
+                n_buy = sum(1 for r in rows if r["side"] == "BUY")
+                n_sell = sum(1 for r in rows if r["side"] == "SELL")
+                n_glob = len(rows) - n_buy - n_sell
+                lines.append(f"{asset}: BUY {n_buy} | SELL {n_sell} | global {n_glob} "
+                             f"(Excel: {os.path.basename(fname)})")
+            latest = [r for _, rows, _ in results for r in rows[-10:]]
+            if latest:
+                lines.append("Latest signals (all coins):")
+                latest.sort(key=lambda r: (r["ts"], r["asset"], r["chart_tf"]))
+                for r in latest[-10:][::-1]:          # newest first
+                    lines.append(self._hist_line(r, with_asset=True))
+        else:
+            asset, rows, fname = results[0]
+            n_buy = sum(1 for r in rows if r["side"] == "BUY")
+            n_sell = sum(1 for r in rows if r["side"] == "SELL")
+            n_glob = len(rows) - n_buy - n_sell
             lines = [f"📊 VC69V5 history | {asset}/{asset_quote(asset)}",
                      f"chart {','.join(p.chart_tfs)} / LTF {p.lower_tf} | last {p.history_days} days | times {TZ_LABEL}",
                      f"BUY {n_buy} | SELL {n_sell} | global {n_glob}"]
             if rows:
                 lines.append("Latest signals:")
                 for r in rows[-10:][::-1]:
-                    parts = []
-                    if r["spot_count"]:
-                        parts.append(f"spot {r['spot_count']}")
-                    if r["futures_count"]:
-                        parts.append(f"fut {r['futures_count']}")
-                    if r["cfd_count"]:
-                        parts.append(f"cfd {r['cfd_count']}")
-                    if r["tvspot_count"]:
-                        parts.append(f"tvspot {r['tvspot_count']}")
-                    if r["tvperp_count"]:
-                        parts.append(f"tvperp {r['tvperp_count']}")
-                    if r["weight"] != "":
-                        parts.append(f"{r['weight']}%")
-                    w_txt = (" " + " | ".join(parts)) if parts else ""
-                    lines.append(f"{r['time']} {r['chart_tf']} {r['side']}{w_txt}")
+                    lines.append(self._hist_line(r))
             lines.append(f"Excel: {os.path.basename(fname)}")
-            await send_telegram(p, "\n".join(lines))
+        await send_telegram(p, "\n".join(lines))
 
     # ---- live --------------------------------------------------------
     def start_live(self, p):
@@ -1743,9 +1846,10 @@ class Engine:
             self.loop.call_soon_threadsafe(self.live_stop.set)
 
     async def run_live(self, p, stop):
-        log.info("=== LIVE %s | chart %s | LTF %s ===", ",".join(ASSETS), ",".join(p.chart_tfs), p.lower_tf)
+        assets = live_assets_for(p)
+        log.info("=== LIVE %s | chart %s | LTF %s ===", ",".join(assets), ",".join(p.chart_tfs), p.lower_tf)
         await self.ensure_exchanges(p.exchanges, p.proxy)
-        series_by = self.build_sources(ASSETS, p)
+        series_by = self.build_sources(assets, p)
         all_series = [s for lst in series_by.values() for s in lst]
         ccxt_series = [s for s in all_series if s.label.endswith(("-S", "-F"))]
         tv_series = [s for s in all_series if s.label.endswith((TV_CFD_SUFFIX,
@@ -2089,13 +2193,14 @@ class App:
         ttk.Button(bar, text="None", width=6, command=lambda: [v.set(False) for v in self.v_ex.values()]).pack(side="left")
 
         # --- history
-        fh = ttk.LabelFrame(left, text="History (one coin)")
+        fh = ttk.LabelFrame(left, text="History (one coin or ALL)")
         fh.pack(fill="x", pady=(8, 0))
         self.v_hcoin = tk.StringVar(value="BTC")
         self.v_hdays = tk.StringVar(value=str(d.history_days))
         self.v_hsend = tk.BooleanVar(value=True)
         ttk.Label(fh, text="Coin").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Combobox(fh, textvariable=self.v_hcoin, values=ASSETS, width=10, state="readonly").grid(row=0, column=1, sticky="w", **pad)
+        ttk.Combobox(fh, textvariable=self.v_hcoin, values=("ALL",) + tuple(ASSETS),
+                     width=10, state="readonly").grid(row=0, column=1, sticky="w", **pad)
         ttk.Label(fh, text="Days back").grid(row=1, column=0, sticky="w", **pad)
         ttk.Spinbox(fh, textvariable=self.v_hdays, from_=1, to=365, width=12).grid(row=1, column=1, sticky="w", **pad)
         ttk.Checkbutton(fh, text="Send summary to Telegram", variable=self.v_hsend).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
@@ -2107,13 +2212,19 @@ class App:
                                         state="disabled", width=7)
         self.btn_hist_stop.pack(side="left")
 
-        # --- live
-        fl = ttk.LabelFrame(left, text="Live (BTC, PEPE, ZEC, XAU at the same time)")
+        # --- live (coin dropdown: one coin, or ALL = every coin at once)
+        fl = ttk.LabelFrame(left, text="Live - coins to monitor")
         fl.pack(fill="x", pady=(8, 0))
+        ttk.Label(fl, text="Coins").pack(side="left", padx=(6, 4), pady=6)
+        self.v_coins = tk.StringVar(value="ALL")
+        ttk.Combobox(fl, textvariable=self.v_coins, values=("ALL",) + tuple(ASSETS),
+                     width=10, state="readonly").pack(side="left", pady=6)
         self.btn_live = ttk.Button(fl, text="Start live", command=self.on_live)
         self.btn_live.pack(side="left", padx=6, pady=6)
         self.btn_stop = ttk.Button(fl, text="Stop live", command=self.on_stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6, pady=6)
+        ttk.Label(fl, text="ALL = every coin at the same time",
+                  foreground="gray").pack(side="left", padx=(6, 0))
 
         # --- telegram / proxy
         ft = ttk.LabelFrame(left, text="Telegram / proxy")
@@ -2161,10 +2272,10 @@ class App:
         sb.pack(side="right", fill="y")
         self.txt.pack(fill="both", expand=True)
 
-        cols = ("time", "tf", "side", "spot", "futures", "cfd", "tvspot", "tvperp",
-                "weight", "names")
+        cols = ("time", "asset", "tf", "side", "spot", "futures", "cfd", "tvspot",
+                "tvperp", "weight", "names")
         self.tree = ttk.Treeview(tab_hist, columns=cols, show="headings")
-        for c, w in zip(cols, (190, 60, 110, 80, 90, 80, 80, 80, 70, 1800)):
+        for c, w in zip(cols, (190, 60, 60, 110, 80, 90, 80, 80, 80, 70, 1800)):
             self.tree.heading(c, text=f"bar start ({TZ_LABEL})" if c == "time" else c)
             self.tree.column(c, width=w, anchor="w")
         for tag, color in (("buy", "#4ade80"), ("sell", "#f87171"), ("long", "#60a5fa"), ("short", "#facc15")):
@@ -2207,6 +2318,7 @@ class App:
                 use_tv_spot=self.v_tvs.get(),
                 use_tv_perp=self.v_tvp.get(),
                 exchanges=tuple(l for l, _ in EXCHANGES if self.v_ex[l].get()),
+                live_assets=() if self.v_coins.get() == "ALL" else (self.v_coins.get(),),
                 history_asset=self.v_hcoin.get(),
                 history_days=int(self.v_hdays.get()),
                 tg_history=self.v_hsend.get(),
@@ -2327,8 +2439,9 @@ class App:
                     for r in reversed(payload):   # newest first
                         side = r["side"]
                         self.tree.insert("", "end", values=(
-                            r["time"], r["chart_tf"], side, r["spot_count"], r["futures_count"],
-                            r["cfd_count"], r["tvspot_count"], r["tvperp_count"],
+                            r["time"], r["asset"], r["chart_tf"], side,
+                            r["spot_count"], r["futures_count"], r["cfd_count"],
+                            r["tvspot_count"], r["tvperp_count"],
                             f"{r['weight']}%" if r["weight"] != "" else "",
                             (str(r["exchanges"]) + ("  |  " + r["pairs"] if r.get("pairs") else ""))),
                             tags=({"BUY": "buy", "SELL": "sell", "GLOBAL LONG": "long",
