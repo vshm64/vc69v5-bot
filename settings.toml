@@ -62,17 +62,17 @@ show_global_signals = false  # سیگنال GLOBAL LONG / SHORT
 enabled = true
 chart_timeframes = ["3m", "15m", "30m", "45m"]
 lower_timeframe = "1m"
-spot    = { exchanges = 2, weight = 10 }
-futures = { exchanges = 2, weight = 10 }
-cfd     = { exchanges = 2, weight = 10 }
+spot    = { exchanges = 6, weight = 40 }
+futures = { exchanges = 6, weight = 40 }
+cfd     = { exchanges = 10, weight = 40 }
 total_weight = 10
 
 [PEPE]
 enabled = true
 chart_timeframes = ["3m", "15m", "30m", "45m"]
 lower_timeframe = "1m"
-spot    = { exchanges = 2, weight = 10 }
-futures = { exchanges = 2, weight = 10 }
+spot    = { exchanges = 6, weight = 40 }
+futures = { exchanges = 6, weight = 40 }
 cfd     = { exchanges = 0, weight = 0 }
 total_weight = 10
 
@@ -80,7 +80,7 @@ total_weight = 10
 enabled = true
 chart_timeframes = ["3m", "15m", "30m", "45m"]
 lower_timeframe = "1m"
-spot    = { exchanges = 2, weight = 10 }
-futures = { exchanges = 2, weight = 10 }
+spot    = { exchanges = 4, weight = 40 }
+futures = { exchanges = 4, weight = 40 }
 cfd     = { exchanges = 0, weight = 0 }
 total_weight = 10
